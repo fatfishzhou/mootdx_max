@@ -27,6 +27,18 @@
 -   操作系统: Windows / MacOS / Linux 都可以运行.
 -   Python: 3.8 以及以上版本.
 
+项目说明
+--------
+
+-   当前仓库已经内置 `tdxpy` 协议层源码，不再依赖外部安装的 `tdxpy` 才能开发和调试底层逻辑。
+-   在线接口已经补充了更适合二次开发的工具库能力:
+    - `strict_connect=True`: 初始化时连不上直接失败
+    - `strict_io=True`: 请求失败时显式抛错，而不是静默返回空结果
+    - `raw=True` 或 `as_dataframe=False`: 直接返回原始 list/dict 结构，跳过 `DataFrame` 转换
+    - `health()` / `diagnostics()`: 返回连接状态、流量统计、请求控制和缓存概况
+    - `request_interval` / `requests_per_minute`: 用于保守限速，减少对服务器的冲击
+-   低风险只读接口已经带短 TTL 缓存，包括 `stock_count()`、`stocks()`、`stock_all()`；`xdxr` 文件缓存也已修正为空结果不落盘。
+
 安装方法
 --------
 
@@ -48,7 +60,7 @@ pip install 'mootdx[all]'
 ### 升级安装
 
 ```shell
-pip install -U tdxpy mootdx
+pip install -U mootdx
 ```
 
 > 如果不清楚各种依赖关系就用这个命令 `pip install -U 'mootdx[all]'`
@@ -84,7 +96,13 @@ reader.fzline(symbol='600036')
 from mootdx.quotes import Quotes
 
 # 标准市场
-client = Quotes.factory(market='std', multithread=True, heartbeat=True)
+client = Quotes.factory(
+    market='std',
+    heartbeat=True,
+    strict_connect=True,     # 初始化连不上时直接失败
+    request_interval=0.1,    # 请求最小间隔(秒)
+    requests_per_minute=60,  # 每分钟最大请求数
+)
 
 # k 线数据
 client.bars(symbol='600036', frequency=9, offset=10)
@@ -94,6 +112,38 @@ client.index(symbol='000001', frequency=9)
 
 # 分钟
 client.minute(symbol='000001')
+
+# 原始结果，适合你外部程序自己做落库/处理
+client.bars(symbol='600036', offset=10, raw=True)
+
+# 健康状态/诊断信息
+client.health()
+```
+
+工具库增强示例
+--------------
+
+```python
+from mootdx.quotes import Quotes
+
+client = Quotes.factory(
+    market='std',
+    strict_connect=True,
+    request_interval=0.2,
+    requests_per_minute=120,
+)
+
+try:
+    # 默认返回 pandas.DataFrame
+    bars_df = client.bars(symbol='600036', offset=5)
+
+    # raw 模式直接返回底层 list/dict
+    bars_raw = client.bars(symbol='600036', offset=5, raw=True)
+
+    # 查看连接、流量和缓存状态
+    print(client.health())
+finally:
+    client.close()
 ```
 
 通达信财务数据读取
