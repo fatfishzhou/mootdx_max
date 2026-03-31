@@ -42,7 +42,7 @@ class BaseFinancial:
 
         try:
             default = config.get('SERVER').get('GP')[0][1:]
-            self.bestip = config.get('BESTIP').get('GP', default)
+            self.bestip = config.get('BESTIP').get('GP') or default
         except ValueError as ex:
             logger.error(ex)
             self.bestip = ('106.14.95.149', 7727)

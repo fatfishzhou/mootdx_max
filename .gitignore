@@ -67,3 +67,6 @@ target/
 .idea
 .github
 .DS_Store
+.venv/
+.venv311/
+.mootdx/

@@ -8,7 +8,7 @@ Mootdx 是一款纯 Python 语言开发的类似 TDX 的行情数据接口的实
 
 ## 项目特点
 
-- 基于 `pytdx` 二次封装。
+- 基于仓库内置的 `tdxpy` 协议层实现。
 - 完全支持 `3.6+`
 - 支持全平台 `Windows / MacOS / Linux`
 - 更加友好的API接口
@@ -17,8 +17,8 @@ Mootdx 是一款纯 Python 语言开发的类似 TDX 的行情数据接口的实
 ## 运行环境
 
 - 操作系统: `Windows / MacOS / Linux` 都可以运行.
-- Python: `3.6` 以及以上版本, 不支持`python2`.
-- 依赖库: `pytdx>=1.67` (之后会转向使用`tdxpy`)
+- Python: `3.8` 以及以上版本, 不支持 `python2`.
+- 核心协议层: `tdxpy`
 
 ## 快速安装
 

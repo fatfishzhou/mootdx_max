@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import datetime
 
 import pandas
@@ -59,6 +60,42 @@ def valid_server(server):
     return None
 
 
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized in ['1', 'true', 'yes', 'y', 'on']:
+            return True
+
+        if normalized in ['0', 'false', 'no', 'n', 'off', '']:
+            return False
+
+    return bool(value)
+
+
+def _coerce_non_negative_float(value, default=0.0):
+    if value is None or value == '':
+        return float(default)
+
+    try:
+        return max(float(value), 0.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'request_interval 参数错误: {value!r}') from exc
+
+
+def _coerce_non_negative_int(value, default=None):
+    if value is None or value == '':
+        return default
+
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'requests_per_minute 参数错误: {value!r}') from exc
+
+
 class BaseQuotes(object):
     client = None
     bestip = None
@@ -67,7 +104,16 @@ class BaseQuotes(object):
     verbose = False
     timeout = 15
 
-    def __init__(self, server=None, bestip: bool = False, timeout: int = None, **kwargs) -> None:
+    def __init__(
+        self,
+        server=None,
+        bestip: bool = False,
+        timeout: int = None,
+        request_interval=0.0,
+        requests_per_minute=None,
+        strict_connect=False,
+        **kwargs,
+    ) -> None:
         logger.debug('config.setup()')
         config.setup()
 
@@ -83,14 +129,40 @@ class BaseQuotes(object):
         self.verbose = kwargs.get('verbose', False)
         logger.debug(f'verbose => {self.verbose}')
 
+        self.request_control = self._normalize_request_control(
+            request_interval=request_interval,
+            requests_per_minute=requests_per_minute,
+            strict_connect=strict_connect,
+        )
+        self.request_interval = self.request_control['request_interval']
+        self.requests_per_minute = self.request_control['requests_per_minute']
+        self.strict_connect = self.request_control['strict_connect']
+        self._last_connect_error = None
+
+    @staticmethod
+    def _normalize_request_control(request_interval=0.0, requests_per_minute=None, strict_connect=False):
+        return {
+            'request_interval': _coerce_non_negative_float(request_interval, default=0.0),
+            'requests_per_minute': _coerce_non_negative_int(requests_per_minute, default=None),
+            'strict_connect': _coerce_bool(strict_connect),
+        }
+
     def __del__(self):
         logger.debug('call __del__')
         self.close()
 
     def reconnect(self):
-        if self.closed:
+        if self.client is None:
+            return False
+
+        if hasattr(self.client, 'reconnect'):
+            return self.client.reconnect()
+
+        if self.closed and self.server:
             logger.debug('服务器连接已断开，正进行重新连接...')
-            self.client.connect(*self.bestip)
+            return self.client.connect(*self.server)
+
+        return False
 
     def close(self):
         logger.debug('close')
@@ -98,13 +170,64 @@ class BaseQuotes(object):
 
     @property
     def closed(self) -> bool:
-        if not hasattr(self.client.client, '_closed') or getattr(self.client.client, '_closed'):
+        client = getattr(self, 'client', None)
+        socket_client = getattr(client, 'client', None)
+
+        if socket_client is None:
+            return True
+
+        if not hasattr(socket_client, '_closed') or getattr(socket_client, '_closed'):
             return True
 
         return False
 
     def pool(self):
         ...
+
+    def _connect_client(self, client, ip, port, time_out, strict_connect=False, server_name='server'):
+        connected = client.connect(ip, int(port), time_out=time_out)
+
+        if not connected:
+            self._last_connect_error = f'{server_name} connect failed: {ip}:{port}'
+            logger.warning(self._last_connect_error)
+
+            if strict_connect:
+                raise RuntimeError(self._last_connect_error)
+        else:
+            self._last_connect_error = None
+
+        return connected
+
+    def health(self):
+        traffic = None
+
+        if hasattr(self.client, 'get_traffic_stats'):
+            try:
+                traffic = self.client.get_traffic_stats()
+            except Exception as exc:  # noqa
+                traffic = {'error': str(exc)}
+
+        payload = {
+            'client_type': type(self.client).__name__ if self.client else None,
+            'server': self.server,
+            'closed': self.closed,
+            'connected': not self.closed,
+            'strict_connect': self.strict_connect,
+            'request_control': dict(self.request_control),
+            'last_connect_error': self._last_connect_error,
+            'traffic': traffic,
+        }
+
+        if hasattr(self, '_read_cache'):
+            payload['cache_entries'] = len(self._read_cache)
+
+        if hasattr(self, 'cache_ttls'):
+            payload['cache_ttls'] = dict(self.cache_ttls)
+
+        return payload
+
+    def diagnostics(self):
+        return self.health()
 
 
 instance: BaseQuotes
@@ -131,8 +254,25 @@ class StdQuotes(BaseQuotes):
     """
     股票市场实时行情"""
 
-    def __init__(self, server=None, bestip=False, timeout=15, heartbeat=False, auto_retry=True, raise_exception=False,
-                 **kwargs):
+    DEFAULT_CACHE_TTLS = {
+        'stock_count': 30,
+        'stocks': 300,
+        'stock_all': 300,
+    }
+
+    def __init__(
+        self,
+        server=None,
+        bestip=False,
+        timeout=15,
+        heartbeat=False,
+        auto_retry=True,
+        raise_exception=False,
+        request_interval=0.0,
+        requests_per_minute=None,
+        strict_connect=False,
+        **kwargs,
+    ):
         """构造函数
 
         :param bestip:  最佳 IP
@@ -140,7 +280,15 @@ class StdQuotes(BaseQuotes):
         :param kwargs:  可变参数
         """
 
-        super().__init__(bestip=bestip, timeout=timeout, server=server, **kwargs)
+        super().__init__(
+            bestip=bestip,
+            timeout=timeout,
+            server=server,
+            request_interval=request_interval,
+            requests_per_minute=requests_per_minute,
+            strict_connect=strict_connect,
+            **kwargs,
+        )
         self.server and config.set('BESTIP', {'HQ': self.server})
 
         try:
@@ -149,19 +297,89 @@ class StdQuotes(BaseQuotes):
             logger.warning(ex)
         finally:
             default = config.get('SERVER').get('HQ')[0][1:]
-            self.server = config.get('BESTIP').get('HQ', default)
+            self.server = config.get('BESTIP').get('HQ') or default
 
         logger.debug(f'server: {self.server}')
         ip, port = self.server
+        self.bestip = self.server
 
-        self.client = TdxHq_API(heartbeat=heartbeat, auto_retry=auto_retry, raise_exception=raise_exception)
-        self.client.connect(ip, int(port), time_out=timeout)
+        # 只缓存低风险只读接口，默认短 TTL，避免长时间陈旧。
+        self._read_cache = {}
+        self.cache_ttls = self._build_cache_ttls(kwargs)
+
+        self.client = TdxHq_API(
+            heartbeat=heartbeat,
+            auto_retry=auto_retry,
+            raise_exception=raise_exception,
+            request_interval=self.request_interval,
+            requests_per_minute=self.requests_per_minute,
+        )
+        self._connect_client(self.client, ip, port, time_out=timeout, strict_connect=self.strict_connect, server_name='std')
 
         global instance
         instance = self
 
+    @classmethod
+    def _build_cache_ttls(cls, kwargs):
+        cache_ttls = dict(cls.DEFAULT_CACHE_TTLS)
+        cache_ttls.update(kwargs.get('cache_ttls', {}))
+
+        for key in cls.DEFAULT_CACHE_TTLS:
+            override = kwargs.get(f'{key}_cache_ttl')
+            if override is not None:
+                cache_ttls[key] = override
+
+        return {key: max(int(value), 0) for key, value in cache_ttls.items()}
+
+    def _cache_get(self, key):
+        cached = self._read_cache.get(key)
+        if not cached:
+            return None
+
+        expires_at, value = cached
+        if time.monotonic() >= expires_at:
+            self._read_cache.pop(key, None)
+            return None
+
+        if isinstance(value, pd.DataFrame):
+            return value.copy(deep=True)
+
+        return value
+
+    def _cache_set(self, key, value, ttl):
+        if ttl <= 0:
+            return value
+
+        cached_value = value.copy(deep=True) if isinstance(value, pd.DataFrame) else value
+        self._read_cache[key] = (time.monotonic() + ttl, cached_value)
+        return value
+
+    def clear_cache(self, *names):
+        if not names:
+            self._read_cache.clear()
+            return
+
+        prefixes = set(names)
+        for key in list(self._read_cache.keys()):
+            if key and key[0] in prefixes:
+                self._read_cache.pop(key, None)
+
     def traffic(self):
-        return self.client.get_traffic_stats()
+        if hasattr(self.client, 'get_traffic_stats'):
+            return self.client.get_traffic_stats()
+
+        return {
+            'send_pkg_num': 0,
+            'recv_pkg_num': 0,
+            'send_pkg_bytes': 0,
+            'recv_pkg_bytes': 0,
+            'first_pkg_send_time': None,
+            'total_seconds': None,
+            'send_bytes_per_second': None,
+            'recv_bytes_per_second': None,
+            'last_api_send_bytes': 0,
+            'last_api_recv_bytes': 0,
+        }
 
     def quotes(self, symbol=None, **kwargs):
         """
@@ -203,7 +421,7 @@ class StdQuotes(BaseQuotes):
 
         return to_data(result, symbol=symbol, client=self, **kwargs)
 
-    def stock_count(self, market=MARKET_SH):
+    def stock_count(self, market=MARKET_SH, refresh=False):
         """
         获取市场股票数量
 
@@ -213,11 +431,18 @@ class StdQuotes(BaseQuotes):
         if market not in [0, 1, 2]:
             raise MootdxValidationException('市场代码错误')
 
+        cache_key = ('stock_count', market)
+        if not refresh:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
+
         result = self.client.get_security_count(market=market)
+        self._cache_set(cache_key, result, self.cache_ttls['stock_count'])
 
         return result
 
-    def stocks(self, market=MARKET_SH):
+    def stocks(self, market=MARKET_SH, refresh=False):
         """
         获取股票列表
 
@@ -228,22 +453,43 @@ class StdQuotes(BaseQuotes):
         if market not in [0, 1]:
             raise MootdxValidationException('市场代码错误, 目前只支持沪深市场')
 
-        counts = self.stock_count(market=market)
-        stocks = None
+        cache_key = ('stocks', market)
+        if not refresh:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
+
+        counts = self.stock_count(market=market, refresh=refresh)
+        chunks = []
 
         if counts > 0:
             for start in tqdm(range(0, counts, 1000), ascii=True):
                 result = self.client.get_security_list(market=market, start=start)
-                stocks = pandas.concat([stocks, to_data(result)], ignore_index=True) if start > 1 else to_data(result)
+                chunk = to_data(result)
+                if not chunk.empty:
+                    chunks.append(chunk)
 
+        if not chunks:
+            # 不缓存空结果，避免短暂网络波动把空值固化到 TTL 窗口内。
+            return pandas.DataFrame()
+
+        stocks = pandas.concat(chunks, ignore_index=True)
+        self._cache_set(cache_key, stocks, self.cache_ttls['stocks'])
         return stocks
 
-    def stock_all(self):
-        stocks = None
+    def stock_all(self, refresh=False):
+        cache_key = ('stock_all',)
+        if not refresh:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
 
-        for m in [0, 1]:
-            stocks = pandas.concat([stocks, self.stocks(m)], ignore_index=True)
+        chunks = [data for data in (self.stocks(m, refresh=refresh) for m in [0, 1]) if data is not None and not data.empty]
+        if not chunks:
+            return pandas.DataFrame()
 
+        stocks = pandas.concat(chunks, ignore_index=True)
+        self._cache_set(cache_key, stocks, self.cache_ttls['stock_all'])
         return stocks
 
     def index_bars(self, symbol='000001', frequency=9, start=0, offset=800, **kwargs):
@@ -444,10 +690,15 @@ class StdQuotes(BaseQuotes):
 
         for i in range(math.ceil((last - first) / 800)):
             data = self.client.get_security_bars(9, market, code, (first + i * 800), 800)
-            temp.append(self.client.to_df(data))
+            chunk = self.client.to_df(data)
+            if chunk is not None and not chunk.empty:
+                temp.append(chunk)
+
+        if not temp:
+            return pd.DataFrame()
 
         data = pd.concat(temp)
-        data = data.assign(date=data['datetime'].apply(lambda x: str(x)[0:10])).assign(code=str(code))
+        data = data.assign(date=data['datetime'].astype(str).str.slice(0, 10), code=str(code))
         data = data.set_index('date', drop=False, inplace=False)
         data = data.drop(['year', 'month', 'day', 'hour', 'minute', 'datetime'], axis=1)
         data = data.loc[(data.date >= start_date) & (data.date < end_date)]
@@ -505,7 +756,16 @@ class ExtQuotes(BaseQuotes):
 
     # server = ("112.74.214.43", 7727)
 
-    def __init__(self, server: list = None, bestip=False, timeout=15, **kwargs):
+    def __init__(
+        self,
+        server: list = None,
+        bestip=False,
+        timeout=15,
+        request_interval=0.0,
+        requests_per_minute=None,
+        strict_connect=False,
+        **kwargs,
+    ):
         """
         构造函数
 
@@ -513,7 +773,15 @@ class ExtQuotes(BaseQuotes):
         :param timeout: 超时时间
         :param kwargs:  可变参数
         """
-        super().__init__(bestip=bestip, timeout=timeout, server=server, **kwargs)
+        super().__init__(
+            bestip=bestip,
+            timeout=timeout,
+            server=server,
+            request_interval=request_interval,
+            requests_per_minute=requests_per_minute,
+            strict_connect=strict_connect,
+            **kwargs,
+        )
         self.server and config.set('BESTIP', {'EX': self.server})
 
         logger.warning('目前扩展市场行情接口已经失效, 后期有望修复.')
@@ -524,15 +792,22 @@ class ExtQuotes(BaseQuotes):
             logger.warning(ex)
         finally:
             default = config.get('SERVER').get('EX')[0]
-            self.server = config.get('BESTIP').get('EX', default)
+            self.server = config.get('BESTIP').get('EX') or default
+        self.bestip = self.server
 
         for x in ['verbose', 'server', 'quiet']:
             if x in kwargs.keys():
                 del kwargs[x]
 
         try:
-            self.client = TdxExHq_API(raise_exception=False, auto_retry=True, **kwargs)
-            self.client.connect(*self.server)
+            self.client = TdxExHq_API(
+                raise_exception=False,
+                auto_retry=True,
+                request_interval=self.request_interval,
+                requests_per_minute=self.requests_per_minute,
+                **kwargs,
+            )
+            self._connect_client(self.client, *self.server, time_out=timeout, strict_connect=self.strict_connect, server_name='ext')
         except Exception:  # noqa
             logger.error('服务器连接超时.')
 

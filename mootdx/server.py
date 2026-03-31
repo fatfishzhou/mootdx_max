@@ -3,6 +3,7 @@ import functools
 import json
 import socket
 import time
+from copy import deepcopy
 from functools import partial
 
 from tdxpy.constants import hq_hosts
@@ -24,6 +25,43 @@ hosts = {
 
 results = {k: [] for k in hosts}
 
+DEFAULT_FAILURE_COOLDOWN = 30.0
+MAX_FAILURE_COOLDOWN = 300.0
+_probe_state = {k: {} for k in hosts}
+
+
+def _proxy_key(proxy):
+    return proxy.get('addr'), int(proxy.get('port'))
+
+
+def _probe_snapshot(index, proxy):
+    return _probe_state[index].get(_proxy_key(proxy), {'failures': 0, 'cooldown_until': 0.0})
+
+
+def _probe_success(index, proxy):
+    _probe_state[index][_proxy_key(proxy)] = {'failures': 0, 'cooldown_until': 0.0}
+
+
+def _probe_failure(index, proxy, now=None):
+    now = time.monotonic() if now is None else now
+    state = _probe_snapshot(index, proxy)
+    failures = state['failures'] + 1
+    cooldown = min(DEFAULT_FAILURE_COOLDOWN * failures, MAX_FAILURE_COOLDOWN)
+    _probe_state[index][_proxy_key(proxy)] = {
+        'failures': failures,
+        'cooldown_until': now + cooldown,
+    }
+
+
+def _is_in_cooldown(index, proxy, now=None):
+    now = time.monotonic() if now is None else now
+    return _probe_snapshot(index, proxy)['cooldown_until'] > now
+
+
+def _available_hosts(index, now=None):
+    now = time.monotonic() if now is None else now
+    return [deepcopy(proxy) for proxy in hosts[index] if not _is_in_cooldown(index, proxy, now=now)]
+
 
 def callback(res, key):
     """
@@ -40,7 +78,7 @@ def callback(res, key):
     # logger.debug(f"callback: {res.result()}")
 
 
-def connect(proxy: dict) -> dict:
+def connect(proxy: dict, index='GP') -> dict:
     """
     连接服务器函数
 
@@ -57,21 +95,28 @@ def connect(proxy: dict) -> dict:
         sock.close()
 
         proxy['time'] = (time.perf_counter() - start) * 1000
+        _probe_success(index, proxy)
 
         logger.debug('{addr}:{port} 验证通过，响应时间：{time} ms.'.format(**proxy))
     except socket.timeout as ex:  # noqa
         logger.debug('{addr},{port} time out.'.format(**proxy))
         proxy['time'] = None
+        _probe_failure(index, proxy)
     except ConnectionRefusedError as ex:  # noqa
         logger.debug('{addr},{port} 验证失败.'.format(**proxy))
         proxy['time'] = None
+        _probe_failure(index, proxy)
+    except Exception:  # noqa
+        logger.debug('{addr},{port} 验证失败.'.format(**proxy))
+        proxy['time'] = None
+        _probe_failure(index, proxy)
 
     return proxy
 
 
 def connect2(proxy, index='HQ'):
     if index == 'GP':
-        return connect(proxy)
+        return connect(proxy, index=index)
 
     api = (TdxHq_API(), TdxExHq_API())[index != 'HQ']
     fun = ('get_security_count', 'get_instrument_count')[index != 'HQ']
@@ -83,14 +128,18 @@ def connect2(proxy, index='HQ'):
             tms = time.perf_counter()
             if getattr(api, fun)():
                 proxy['time'] = (time.perf_counter() - tms) * 1000
+                _probe_success(index, proxy)
                 logger.debug('{addr}:{port} 验证通过，响应时间：{time} ms.'.format(**proxy))
             else:
+                _probe_failure(index, proxy)
                 logger.debug('{addr}:{port} 验证失败.'.format(**proxy))
     except socket.timeout:  # noqa
         logger.debug('{addr}:{port} time out.'.format(**proxy))
         proxy['time'] = None
+        _probe_failure(index, proxy)
     except Exception:  # noqa
         logger.debug('{addr}:{port} 验证失败.'.format(**proxy))
+        _probe_failure(index, proxy)
 
     return proxy
 
@@ -107,7 +156,14 @@ async def verify(proxy: dict, index):
 
 
 def server(index=None, limit=5, console=False, sync=True):
-    _hosts = hosts[index]
+    global results
+
+    _hosts = _available_hosts(index)
+
+    if not _hosts:
+        logger.warning(f'{index} 当前所有候选服务器都处于冷却期，跳过本轮探测。')
+        results[index] = []
+        return []
 
     def async_event():
         event = asyncio.get_event_loop()
@@ -122,12 +178,11 @@ def server(index=None, limit=5, console=False, sync=True):
         # event.is_running()
         event.run_until_complete(asyncio.wait(tasks))
 
-    global results
-
     if sync:
-        results[index] = [connect(proxy) for proxy in _hosts]
+        results[index] = [connect2(proxy, index=index) for proxy in _hosts]
         results[index] = [x for x in results[index] if x.get('time')]
     else:
+        results[index] = []
         async_event()
 
     servers = results[index]

@@ -15,15 +15,8 @@ from mootdx.logger import logger
 
 
 def get_stock_markets(symbols=None):
-    results = []
-
     assert isinstance(symbols, list), 'stock code need list type'
-
-    if isinstance(symbols, list):
-        for symbol in symbols:
-            results.append([get_stock_market(symbol, string=False), symbol.strip('sh').strip('sz')])
-
-    return results
+    return [[get_stock_market(symbol, string=False), symbol.strip('sh').strip('sz')] for symbol in symbols]
 
 
 def get_stock_market(symbol='', string=False):
@@ -121,12 +114,19 @@ def to_data(v, **kwargs):
     """
     数值转换为 pd.DataFrame
 
+    :param raw:         True 时直接返回原始值，不做 DataFrame 转换
+    :param as_dataframe False 时等价于 raw=True
     :param v: mixed
     :return: pd.DataFrame
     """
 
     symbol = kwargs.get('symbol')
     adjust = kwargs.get('adjust', '').lower()
+    raw = kwargs.get('raw', False)
+    as_dataframe = kwargs.get('as_dataframe', True)
+
+    if raw or not as_dataframe:
+        return v
 
     if adjust in ['01', 'qfq', 'before']:
         adjust = 'qfq'
@@ -135,25 +135,16 @@ def to_data(v, **kwargs):
     else:
         adjust = None
 
-    # 空值
-    if not isinstance(v, DataFrame) and not v:
-        return pd.DataFrame(data=None)
-
-    # DataFrame
     if isinstance(v, DataFrame):
         result = v
-
-    # 列表
     elif isinstance(v, list):
-        result = pd.DataFrame(data=v) if len(v) else None
-
-    # 字典
+        result = pd.DataFrame(v)
     elif isinstance(v, dict):
-        result = pd.DataFrame(data=[v])
-
-    # 空值
+        result = pd.DataFrame([v]) if v else pd.DataFrame()
+    elif not v:
+        result = pd.DataFrame()
     else:
-        result = pd.DataFrame(data=[])
+        result = pd.DataFrame()
 
     if 'datetime' in result.columns:
         result.index = pd.to_datetime(result.datetime)

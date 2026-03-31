@@ -6,19 +6,40 @@ from mootdx.consts import EX_HOSTS
 from mootdx.consts import GP_HOSTS
 from mootdx.consts import HQ_HOSTS
 from mootdx.logger import logger
-from mootdx.server import bestip
 from mootdx.utils import get_config_path
 
 __all__ = ['set', 'get', 'copy', 'update', 'settings']
 
-settings = {
+DEFAULT_SETTINGS = {
     'SERVER': {'HQ': HQ_HOSTS, 'EX': EX_HOSTS, 'GP': GP_HOSTS},
     'BESTIP': {'HQ': '', 'EX': '', 'GP': ''},
     'TDXDIR': 'C:/new_tdx',
 }
 
+settings = copy.deepcopy(DEFAULT_SETTINGS)
+
 BASE = Path(__file__).parent.parent
 CONF = get_config_path('config.json')
+
+
+def _reset_settings():
+    global settings
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
+
+
+def _load_config():
+    with open(CONF, 'r', encoding='utf-8') as fp:
+        options = json.load(fp)
+
+    if isinstance(options, dict):
+        settings.update(options)
+
+
+def _write_config():
+    Path(CONF).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(CONF, 'w', encoding='utf-8') as fp:
+        json.dump(settings, fp, indent=2, ensure_ascii=False)
 
 
 def setup():
@@ -27,19 +48,13 @@ def setup():
 
     :return: bool，true 表示数据导入成功。
     """
-    global settings
-
-    def load_config():
-        options = json.load(open(CONF, 'r', encoding='utf-8'))
-        settings.update(options)
+    _reset_settings()
 
     try:
-        load_config()
+        _load_config()
     except (json.JSONDecodeError, FileNotFoundError):
-        logger.warning(f'未找到配置文件 {CONF}, 正在生成配置文件.')
-        bestip(console=False, limit=5, sync=False)
-    finally:
-        load_config()
+        logger.warning(f'未找到或无法读取配置文件 {CONF}, 正在生成默认配置文件.')
+        _write_config()
 
     return True if settings else False
 

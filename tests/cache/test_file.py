@@ -71,3 +71,14 @@ class TestCacheFile(unittest.TestCase):
 
         pd.testing.assert_frame_equal(actual_df, expected_df)
         mock_file.assert_called_once_with(self.filepath)
+
+    @mock.patch('pandas.read_pickle', return_value=pd.DataFrame())
+    @mock.patch('pandas.DataFrame.to_pickle')
+    def test_empty_cache_refreshes_and_does_not_recache_empty(self, mock_to_pickle: mock.MagicMock,
+                                                              mock_read_pickle: mock.MagicMock) -> None:
+        wrapped_func = file_cache(self.filepath)(lambda: pd.DataFrame())
+
+        actual_df = wrapped_func()
+
+        assert actual_df.empty
+        mock_to_pickle.assert_not_called()
